@@ -1,0 +1,349 @@
+
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>四面全息投影產生器</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#000;color:#fff;font:14px system-ui,sans-serif}
+canvas{display:block;width:100vw;height:100vh;object-fit:contain}
+aside{
+  position:fixed;z-index:3;top:12px;left:12px;
+  width:min(325px,calc(100vw - 24px));
+  max-height:calc(100vh - 24px);overflow:auto;
+  padding:17px;background:#202329f2;
+  border:1px solid #555;border-radius:14px;
+  box-shadow:0 5px 22px #000a
+}
+body.light aside{background:#fffffff2;color:#111;border-color:#ccc}
+h2{margin:0 0 12px;font-size:18px;color:#32e6ca}
+label{display:block;margin:10px 0 4px}
+input[type=range]{width:100%;accent-color:#16cbaa}
+button,.upload{
+  display:inline-block;padding:9px 12px;margin:5px 4px 0 0;
+  background:#1bd7b6;border:0;border-radius:7px;
+  font-weight:700;color:#061c18;cursor:pointer
+}
+button:disabled{opacity:.4;cursor:not-allowed}
+.upload input{display:none}
+.note{font-size:12px;line-height:1.6;opacity:.8}
+#status{min-height:22px;color:#44f0ba;margin:7px 0}
+body.light #status{color:#00795e}
+.row{display:flex;gap:12px;align-items:center}
+.row label{margin:8px 0}
+#togglePanel{position:fixed;z-index:4;right:12px;top:12px}
+aside.hide{display:none}
+</style>
+</head>
+<body>
+<button id="togglePanel" type="button">隱藏設定</button>
+
+<aside id="panel">
+<h2>四面全息投影產生器</h2>
+<label class="upload">
+  上傳圖片或影片
+  <input id="file" type="file" accept="image/*,video/*">
+</label>
+
+<div id="status" role="status">請先選擇 JPG、PNG 或 MP4 等素材</div>
+
+<label for="size">影像尺寸</label>
+<input id="size" type="range" min=".10" max=".45" step=".01" value=".27">
+
+<label for="gap">中心距離</label>
+<input id="gap" type="range" min="0" max=".25" step=".01" value=".035">
+
+<div class="row">
+<label><input id="spin" type="checkbox"> 自動旋轉</label>
+<label><input id="pulse" type="checkbox"> 呼吸效果</label>
+</div>
+
+<label for="speed">旋轉速度</label>
+<input id="speed" type="range" min="0.1" max="3" step=".1" value="1">
+
+<div>
+<button id="theme" type="button">切換黑／白介面</button>
+<button id="fullscreen" type="button">全螢幕</button>
+</div>
+
+<div>
+<button id="png" type="button" disabled>下載 PNG 投影圖</button>
+<button id="record" type="button" disabled>錄製影片</button>
+</div>
+
+<p class="note">
+圖片可立即下載 PNG；影片錄製為 WebM（含四面投影），
+再次按下停止並下載。影片播放時可錄製；
+圖片也能錄製旋轉動畫。背景固定黑色以利金字塔投影。
+若瀏覽器不支援錄製，請改用最新版 Chrome 或 Edge。
+</p>
+</aside>
+
+<canvas id="stage"></canvas>
+
+<script>
+(()=>{
+'use strict';
+
+const $=id=>document.getElementById(id);
+const canvas=$('stage');
+const ctx=canvas.getContext('2d',{alpha:false});
+const ui=$('panel');
+
+let media=null,video=null,url=null,ready=false;
+let angle=0,last=0,recorder=null,chunks=[],recordStream=null;
+
+const status=msg=>$('status').textContent=msg;
+
+function resize(){
+  const d=Math.min(devicePixelRatio||1,2);
+  canvas.width=Math.round(innerWidth*d);
+  canvas.height=Math.round(innerHeight*d);
+}
+addEventListener('resize',resize);
+resize();
+
+function cleanup(){
+  ready=false;
+  media=null;
+  if(video){
+    video.pause();
+    video.removeAttribute('src');
+    video.load();
+    video=null;
+  }
+  if(url){
+    URL.revokeObjectURL(url);
+    url=null;
+  }
+  $('png').disabled=true;
+  $('record').disabled=true;
+}
+
+$('file').addEventListener('change',()=>{
+  const f=$('file').files?.[0];
+  if(!f)return;
+
+  if(recorder&&recorder.state==='recording'){
+    status('請先停止錄製再更換素材');
+    return;
+  }
+
+  cleanup();
+  status('素材載入中…');
+  url=URL.createObjectURL(f);
+
+  if(f.type.startsWith('image/')){
+    const img=new Image();
+    img.onload=()=>{
+      media=img;
+      ready=true;
+      $('png').disabled=false;
+      $('record').disabled=!canRecord();
+      status('圖片載入成功，四面投影已顯示');
+    };
+    img.onerror=()=>status('圖片解碼失敗，請改用 JPG 或 PNG');
+    img.src=url;
+  }
+  else if(f.type.startsWith('video/')){
+    const v=document.createElement('video');
+    video=v;
+    v.muted=true;
+    v.loop=true;
+    v.playsInline=true;
+    v.preload='auto';
+
+    v.onloadeddata=()=>{
+      media=v;
+      ready=true;
+      $('png').disabled=false;
+      $('record').disabled=!canRecord();
+      status('影片載入成功，四面投影已顯示');
+      v.play().catch(()=>
+        status('影片已載入；點擊投影畫面開始播放')
+      );
+    };
+
+    v.onerror=()=>status('影片無法解碼，建議使用 H.264 MP4');
+    v.src=url;
+    v.load();
+  }
+  else{
+    status('不支援的檔案，請上傳圖片或影片');
+  }
+});
+
+function paint(t){
+  requestAnimationFrame(paint);
+  const dt=Math.min((t-last||16)/1000,.05);
+  last=t;
+
+  const w=canvas.width,h=canvas.height;
+  const cx=w/2,cy=h/2,unit=Math.min(w,h);
+
+  ctx.fillStyle='#000';
+  ctx.fillRect(0,0,w,h);
+
+  if(!ready||!media){
+    ctx.fillStyle='#888';
+    ctx.textAlign='center';
+    ctx.font=`${Math.max(14,unit*.025)}px sans-serif`;
+    ctx.fillText('請上傳圖片或影片',cx,cy);
+    return;
+  }
+
+  const mw=video?video.videoWidth:media.naturalWidth;
+  const mh=video?video.videoHeight:media.naturalHeight;
+  if(!mw||!mh)return;
+
+  if($('spin').checked){
+    angle+=dt*Number($('speed').value)*.6;
+  }
+
+  const scale=$('pulse').checked
+    ?1+.035*Math.sin(t/350):1;
+
+  const edge=unit*Number($('size').value)*scale;
+  const ratio=Math.max(mw,mh);
+  const dw=edge*mw/ratio;
+  const dh=edge*mh/ratio;
+  const distance=unit*Number($('gap').value)+dh/2;
+
+  ctx.save();
+  ctx.translate(cx,cy);
+  ctx.rotate(angle);
+
+  for(let i=0;i<4;i++){
+    ctx.save();
+    ctx.rotate(i*Math.PI/2);
+    ctx.translate(0,-distance);
+    ctx.drawImage(media,-dw/2,-dh/2,dw,dh);
+    ctx.restore();
+  }
+
+  ctx.restore();
+}
+requestAnimationFrame(paint);
+
+$('theme').onclick=()=>{
+  document.body.classList.toggle('light');
+};
+
+$('togglePanel').onclick=()=>{
+  ui.classList.toggle('hide');
+  $('togglePanel').textContent=
+    ui.classList.contains('hide')?'顯示設定':'隱藏設定';
+};
+
+$('fullscreen').onclick=async()=>{
+  try{
+    if(!document.fullscreenElement)
+      await document.documentElement.requestFullscreen();
+    else
+      await document.exitFullscreen();
+  }catch(e){
+    status('無法進入全螢幕：'+e.message);
+  }
+};
+
+canvas.onclick=()=>{
+  if(video&&video.paused)
+    video.play().catch(()=>{});
+};
+
+function save(blob,name){
+  const a=document.createElement('a');
+  const u=URL.createObjectURL(blob);
+  a.href=u;
+  a.download=name;
+  a.click();
+  setTimeout(()=>URL.revokeObjectURL(u),60000);
+}
+
+$('png').onclick=()=>{
+  if(!ready)return;
+  canvas.toBlob(
+    b=>b?save(b,'hologram-4-sides.png'):
+      status('PNG 匯出失敗'),
+    'image/png'
+  );
+};
+
+function canRecord(){
+  return !!(
+    canvas.captureStream&&
+    window.MediaRecorder&&
+    ['video/webm;codecs=vp9',
+     'video/webm;codecs=vp8',
+     'video/webm'].some(x=>MediaRecorder.isTypeSupported(x))
+  );
+}
+
+$('record').onclick=()=>{
+  if(recorder&&recorder.state==='recording'){
+    recorder.stop();
+    return;
+  }
+
+  if(!ready||!canRecord()){
+    status('此瀏覽器不支援 WebM 錄製，請使用 Chrome／Edge');
+    return;
+  }
+
+  try{
+    chunks=[];
+    recordStream=canvas.captureStream(30);
+
+    const mime=[
+      'video/webm;codecs=vp9',
+      'video/webm;codecs=vp8',
+      'video/webm'
+    ].find(x=>MediaRecorder.isTypeSupported(x));
+
+    recorder=new MediaRecorder(recordStream,{
+      mimeType:mime,
+      videoBitsPerSecond:5000000
+    });
+
+    recorder.ondataavailable=e=>{
+      if(e.data.size)chunks.push(e.data);
+    };
+
+    recorder.onerror=e=>
+      status('錄製失敗：'+(e.error?.message||'未知錯誤'));
+
+    recorder.onstop=()=>{
+      recordStream.getTracks().forEach(x=>x.stop());
+      $('record').textContent='錄製影片';
+
+      if(chunks.length){
+        save(
+          new Blob(chunks,{type:mime}),
+          'hologram-4-sides.webm'
+        );
+        status('影片錄製完成，已下載 WebM');
+      }else{
+        status('沒有錄製到影格，請重試');
+      }
+      recorder=null;
+    };
+
+    if(video&&video.paused)
+      video.play().catch(()=>{});
+
+    recorder.start(1000);
+    $('record').textContent='停止並下載影片';
+    status('錄製中，完成後請按「停止並下載影片」');
+
+  }catch(e){
+    status('無法開始錄製：'+e.message);
+    recordStream?.getTracks().forEach(x=>x.stop());
+  }
+};
+
+})();
+</script>
+</body>
+</html>
